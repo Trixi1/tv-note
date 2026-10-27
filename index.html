@@ -94,7 +94,7 @@
 
   <!-- Note -->
   <section class="view" id="v-note">
-    <div class="head"><h1>Leave a note</h1><span class="pill" id="live">Not sent yet</span></div>
+    <div class="head"><h1>Leave a note</h1><span class="pill" id="live">Connecting…</span></div>
     <div class="stage"><div class="pad" id="pad"><canvas id="c"></canvas><div class="hint" id="hint">Draw here — it appears on the TV live</div></div></div>
     <div class="colors" id="colors">
       <button class="sw on" data-c="#ffffff" style="background:#ffffff" aria-label="White"></button>
@@ -139,6 +139,157 @@
   </section>
 
 <script>
+/* mqtt-lite: tiny MQTT 3.1.1 client over WebSocket (QoS 0 only). ES5, no dependencies.
+   var c = new MqttLite("wss://broker.hivemq.com:8884/mqtt");
+   c.onstatus = function (connected) {};
+   c.subscribe("topic/#", function (topic, text) {});
+   c.publish("topic/x", "hello", { retain: true });
+*/
+(function (root) {
+  "use strict";
+  var enc = new TextEncoder(), dec = new TextDecoder();
+
+  function str(s) { var b = enc.encode(s); return [b.length >> 8, b.length & 255].concat(Array.prototype.slice.call(b)); }
+  function packet(type, body) {
+    var len = body.length, head = [type];
+    do { var d = len % 128; len = Math.floor(len / 128); if (len > 0) d |= 128; head.push(d); } while (len > 0);
+    var out = new Uint8Array(head.length + body.length);
+    out.set(head, 0); out.set(body, head.length);
+    return out;
+  }
+  function concatBytes(a, b) {
+    var arr = new Array(a.length + b.length), i;
+    for (i = 0; i < a.length; i++) arr[i] = a[i];
+    for (i = 0; i < b.length; i++) arr[a.length + i] = b[i];
+    return arr;
+  }
+  function match(filter, topic) {
+    if (filter === topic) return true;
+    var f = filter.split("/"), t = topic.split("/");
+    for (var i = 0; i < f.length; i++) {
+      if (f[i] === "#") return true;
+      if (f[i] !== "+" && f[i] !== t[i]) return false;
+    }
+    return f.length === t.length;
+  }
+
+  function MqttLite(url, opts) {
+    opts = opts || {};
+    this.urls = [].concat(url);
+    this.urlIndex = 0;
+    this.clientId = opts.clientId || ("ml" + Math.random().toString(36).slice(2, 12));
+    this.keepAlive = opts.keepAlive || 30;
+    this.subs = [];
+    this.queue = [];
+    this.connected = false;
+    this.packetId = 1;
+    this.retry = 500;
+    this.onstatus = null;
+    this._connect();
+  }
+
+  MqttLite.prototype._status = function (c) {
+    if (this.connected === c) return;
+    this.connected = c;
+    if (this.onstatus) try { this.onstatus(c); } catch (e) {}
+  };
+
+  MqttLite.prototype._connect = function () {
+    var self = this, url = this.urls[this.urlIndex % this.urls.length];
+    var ws;
+    try { ws = new WebSocket(url, ["mqtt"]); } catch (e) { return this._reconnect(); }
+    ws.binaryType = "arraybuffer";
+    this.ws = ws;
+    this.buf = new Uint8Array(0);
+    ws.onopen = function () {
+      var body = [0, 4, 77, 81, 84, 84, 4, 2, self.keepAlive >> 8, self.keepAlive & 255].concat(str(self.clientId));
+      ws.send(packet(0x10, body));
+    };
+    ws.onmessage = function (ev) { self._data(new Uint8Array(ev.data)); };
+    ws.onclose = ws.onerror = function () {
+      if (self.ws !== ws) return;
+      self.ws = null;
+      clearInterval(self.ping);
+      self._status(false);
+      self._reconnect();
+    };
+  };
+
+  MqttLite.prototype._reconnect = function () {
+    var self = this;
+    clearTimeout(this.rt);
+    this.urlIndex++;
+    this.rt = setTimeout(function () { self._connect(); }, this.retry);
+    this.retry = Math.min(this.retry * 2, 8000);
+  };
+
+  MqttLite.prototype._data = function (chunk) {
+    var b = new Uint8Array(this.buf.length + chunk.length);
+    b.set(this.buf, 0); b.set(chunk, this.buf.length);
+    this.buf = b;
+    while (this.buf.length >= 2) {
+      var mult = 1, len = 0, i = 1, d;
+      do {
+        if (i >= this.buf.length) return;
+        d = this.buf[i++]; len += (d & 127) * mult; mult *= 128;
+      } while (d & 128);
+      if (this.buf.length < i + len) return;
+      var type = this.buf[0], body = this.buf.subarray(i, i + len);
+      this.buf = this.buf.subarray(i + len);
+      this._packet(type, body);
+    }
+  };
+
+  MqttLite.prototype._packet = function (type, body) {
+    var self = this, kind = type >> 4;
+    if (kind === 2) {                       // CONNACK
+      if (body[1] !== 0) { try { this.ws.close(); } catch (e) {} return; }
+      this.retry = 500;
+      this._status(true);
+      this.ping = setInterval(function () { self._send(new Uint8Array([0xC0, 0])); }, this.keepAlive * 800);
+      this.subs.forEach(function (s) { self._sendSub(s.topic); });
+      var q = this.queue; this.queue = [];
+      q.forEach(function (p) { self._send(p); });
+    } else if (kind === 3) {                // PUBLISH
+      var tl = (body[0] << 8) | body[1];
+      var topic = dec.decode(body.subarray(2, 2 + tl));
+      var off = 2 + tl + (((type >> 1) & 3) > 0 ? 2 : 0);
+      var text = dec.decode(body.subarray(off));
+      var retained = (type & 1) === 1;
+      this.subs.forEach(function (s) { if (match(s.topic, topic)) try { s.fn(topic, text, retained); } catch (e) {} });
+    }
+  };
+
+  MqttLite.prototype._send = function (bytes) {
+    if (this.ws && this.connected) { try { this.ws.send(bytes); return true; } catch (e) {} }
+    return false;
+  };
+
+  MqttLite.prototype._sendSub = function (topic) {
+    var id = this.packetId = (this.packetId % 65535) + 1;
+    this._send(packet(0x82, [id >> 8, id & 255].concat(str(topic), [0])));
+  };
+
+  MqttLite.prototype.subscribe = function (topic, fn) {
+    this.subs.push({ topic: topic, fn: fn });
+    if (this.connected) this._sendSub(topic);
+  };
+
+  MqttLite.prototype.publish = function (topic, text, opts) {
+    var p = packet(0x30 | (opts && opts.retain ? 1 : 0), concatBytes(str(topic), enc.encode(text)));
+    if (!this._send(p)) {
+      if (opts && opts.retain) this.queue = this.queue.filter(function (q) { return !q._retainTopic || q._retainTopic !== topic; });
+      if (opts && opts.retain) p._retainTopic = topic;
+      this.queue.push(p);
+      if (this.queue.length > 400) this.queue.shift();
+    }
+  };
+
+  root.MqttLite = MqttLite;
+})(typeof window !== "undefined" ? window : this);
+
+</script>
+<script>
 (function () {
   "use strict";
   // Must match phone.channel in the TV's config.js. A different channel can be passed in the link: …/#channel-name
@@ -174,10 +325,8 @@
         if (r.status === 429) throw new Error("Busy — retrying");
         if (!r.ok) throw new Error("Can't reach TV link");
         queue.shift(); sent++;
-        $("live").textContent = "Live on TV"; $("live").className = "pill ok";
       })
       .catch(function (e) {
-        $("live").textContent = e.message; $("live").className = "pill";
         return new Promise(function (res) { setTimeout(res, 3000); });
       })
       .then(function () { sending = false; pump(); });
@@ -185,8 +334,29 @@
 
   // Listen for the TV's replies
   var es = new EventSource(URL_PUB + "/sse");
-  es.onopen = function () { $("dot").classList.add("on"); $("conn").textContent = "Connected"; };
-  es.onerror = function () { $("dot").classList.remove("on"); $("conn").textContent = "Reconnecting…"; };
+  /* ---------- live drawing link (MQTT) ---------- */
+  var T = "voxmenu/" + CHANNEL;
+  var mq = new MqttLite(["wss://broker.hivemq.com:8884/mqtt", "wss://broker.emqx.io:8084/mqtt"]);
+  mq.onstatus = function (ok) {
+    $("dot").classList.toggle("on", ok);
+    $("conn").textContent = ok ? "Connected" : "Reconnecting…";
+    $("live").textContent = ok ? "Live on TV" : "Offline"; $("live").className = ok ? "pill ok" : "pill";
+  };
+  var mySnapT = 0, snapTimer = null;
+  function sendSnapshot() {
+    clearTimeout(snapTimer);
+    snapTimer = setTimeout(function () {
+      mySnapT = Date.now();
+      mq.publish(T + "/note", JSON.stringify({ v: 1, t: mySnapT, strokes: strokes.map(function (x) { return { id: x.id, c: x.c, w: x.w, p: x.p }; }) }), { retain: true });
+    }, 120);
+  }
+  mq.subscribe(T + "/note", function (t, text) {
+    if (!text || cur) return;
+    var snap; try { snap = JSON.parse(text); } catch (e) { return; }
+    if (snap.t === mySnapT) return;          // our own echo
+    strokes = (snap.strokes || []).map(function (x) { return { id: x.id, c: x.c, w: x.w, p: x.p.slice() }; });
+    redraw();
+  });
   es.onmessage = function (ev) {
     var o; try { o = JSON.parse(ev.data); } catch (e) { return; }
     if (o.event && o.event !== "message") return;
@@ -236,7 +406,7 @@
 
   var cur = null, pending = [], timer = null, last = null;
   function pos(e) { var r = canvas.getBoundingClientRect(); return [Math.round((e.clientX - r.left) / r.width * 1000), Math.round((e.clientY - r.top) / r.height * 1000)]; }
-  function flush() { if (!cur || !pending.length) return; enqueue({ k: "s", s: cur.id, c: cur.c, w: cur.w, p: pending }); pending = []; }
+  function flush() { if (!cur || !pending.length) return; mq.publish(T + "/ink", JSON.stringify({ k: "s", s: cur.id, c: cur.c, w: cur.w, p: pending })); pending = []; }
 
   canvas.addEventListener("pointerdown", function (e) {
     e.preventDefault(); canvas.setPointerCapture(e.pointerId);
@@ -244,7 +414,7 @@
     cur = { id: (Date.now() % 1e9) + Math.floor(Math.random() * 999), c: erasing ? "erase" : color, w: width, p: [p[0], p[1]] };
     strokes.push(cur); last = p; pending = [p[0], p[1]];
     paint(cur, 0); $("hint").hidden = true;
-    timer = setInterval(flush, 700);
+    timer = setInterval(flush, 40);
   });
   canvas.addEventListener("pointermove", function (e) {
     if (!cur) return;
@@ -252,9 +422,9 @@
     if (Math.abs(p[0] - last[0]) + Math.abs(p[1] - last[1]) < 4) return;
     cur.p.push(p[0], p[1]); pending.push(p[0], p[1]); last = p;
     paint(cur, cur.p.length - 2);
-    if (pending.length > 600) flush();
+    if (pending.length > 200) flush();
   });
-  function end() { if (!cur) return; clearInterval(timer); flush(); cur = null; }
+  function end() { if (!cur) return; clearInterval(timer); flush(); cur = null; sendSnapshot(); }
   canvas.addEventListener("pointerup", end);
   canvas.addEventListener("pointercancel", end);
 
@@ -271,9 +441,9 @@
   $("eraser").addEventListener("click", function () { erasing = !erasing; this.classList.toggle("on", erasing); });
   $("undo").addEventListener("click", function () {
     var st = strokes.pop(); if (!st) return;
-    redraw(); enqueue({ k: "undo", s: st.id });
+    redraw(); mq.publish(T + "/ink", JSON.stringify({ k: "undo", s: st.id })); sendSnapshot();
   });
-  $("clear").addEventListener("click", function () { strokes = []; redraw(); enqueue({ k: "clear" }); });
+  $("clear").addEventListener("click", function () { strokes = []; redraw(); mq.publish(T + "/ink", JSON.stringify({ k: "clear" })); sendSnapshot(); });
 
   /* ---------- ask ---------- */
   var waiting = {};
