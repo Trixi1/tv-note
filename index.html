@@ -34,6 +34,10 @@
   .tabs { display: flex; padding: 3px; border-radius: 12px; background: var(--glass); border: 1px solid var(--line); }
   .tab { padding: 6px 14px; border-radius: 9px; font-size: 14px; font-weight: 600; color: var(--ink-2); }
   .tab.on { background: rgba(255,255,255,.9); color: #2a1356; }
+  .showbtn { display: flex; align-items: center; gap: 8px; width: 100%; height: 46px; margin-top: 12px; border-radius: 14px;
+    justify-content: center; font-size: 15px; font-weight: 600; background: rgba(255,255,255,.12); border: 1px solid var(--line); }
+  .showbtn svg { width: 18px; height: 18px; }
+  .showbtn.ok { background: rgba(93,255,154,.18); border-color: rgba(93,255,154,.4); }
 
   .view { flex: 1; min-height: 0; display: flex; flex-direction: column; }
   .head { display: flex; align-items: center; justify-content: space-between; margin: 18px 2px 12px; }
@@ -86,6 +90,7 @@
     <div class="conn"><span class="dot" id="dot"></span><span id="conn">Connecting to TV…</span></div>
     <div class="tabs"><button class="tab on" data-v="note">Note</button><button class="tab" data-v="ask">Ask Claude</button></div>
   </div>
+  <button class="showbtn" id="show"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><rect x="3" y="5" width="18" height="12" rx="2"/><path d="M8 21h8" stroke-linecap="round"/></svg><span id="show-t">Show menu on TV</span></button>
 
   <!-- Note -->
   <section class="view" id="v-note">
@@ -186,8 +191,23 @@
     var o; try { o = JSON.parse(ev.data); } catch (e) { return; }
     if (o.event && o.event !== "message") return;
     var m; try { m = JSON.parse(o.message); } catch (e) { return; }
+    if (m.k === "shown" && m.id === showId) { clearTimeout(showTimer); $("show").className = "showbtn ok"; $("show-t").textContent = "Menu is on the TV"; setTimeout(resetShow, 3000); return; }
     if (m.k === "reply" && waiting[m.id]) { waiting[m.id].className = "b tv"; waiting[m.id].textContent = m.text; delete waiting[m.id]; scrollChat(); }
   };
+
+  /* ---------- show menu ---------- */
+  var showId = null, showTimer = null;
+  function resetShow() { $("show").className = "showbtn"; $("show-t").textContent = "Show menu on TV"; }
+  $("show").addEventListener("click", function () {
+    showId = "s" + Date.now();
+    $("show-t").textContent = "Calling the menu…";
+    enqueue({ k: "show", id: showId });
+    clearTimeout(showTimer);
+    showTimer = setTimeout(function () {
+      $("show-t").textContent = "Menu not running — open Home Menu once with the remote";
+      setTimeout(resetShow, 6000);
+    }, 8000);
+  });
 
   /* ---------- drawing ---------- */
   var canvas = $("c"), pad = $("pad"), ctx = canvas.getContext("2d");
